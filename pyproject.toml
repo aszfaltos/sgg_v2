@@ -1,0 +1,26 @@
+[project]
+name = "sgg-v2"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "effdet>=0.4.1",
+    "h5py>=3.15.1",
+    "optuna>=4.7.0",
+    "pytorch-lightning>=2.6.1",
+    "timm>=1.0.0",
+    "torch>=2.5.0",
+    "torchvision>=0.20.0",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.19.1",
+    "pytest>=9.0.2",
+    "ruff>=0.15.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = "."
+testpaths = ["tests"]
