@@ -24,7 +24,6 @@ class SGGDetectorOutput:
 
     Contains all information needed for scene graph generation:
     - Detection results (boxes, labels, scores)
-    - Raw classification logits for semantic embeddings
     - Pooled ROI features for graph message passing
 
     All list fields have one element per image in the batch.
@@ -33,7 +32,6 @@ class SGGDetectorOutput:
         boxes: List of (N_i, 4) tensors in xyxy format, absolute coordinates.
         labels: List of (N_i,) tensors with predicted class indices.
         scores: List of (N_i,) tensors with confidence scores in [0, 1].
-        logits: List of (N_i, num_classes) tensors with raw classification logits.
         roi_features: (total_boxes, C, H, W) tensor with pooled ROI features,
             where total_boxes = sum(N_i) across all images.
 
@@ -50,7 +48,6 @@ class SGGDetectorOutput:
     boxes: list[Tensor]
     labels: list[Tensor]
     scores: list[Tensor]
-    logits: list[Tensor]
     roi_features: Tensor
 
     def __len__(self) -> int:
@@ -80,7 +77,6 @@ class SGGDetectorOutput:
             boxes=[b.to(device) for b in self.boxes],
             labels=[lbl.to(device) for lbl in self.labels],
             scores=[s.to(device) for s in self.scores],
-            logits=[lg.to(device) for lg in self.logits],
             roi_features=self.roi_features.to(device),
         )
 
@@ -92,7 +88,6 @@ class SGGDetector(nn.Module, ABC):
     needed for scene graph generation in a single forward pass:
     - Bounding boxes for detected objects
     - Predicted class labels and confidence scores
-    - Raw classification logits (for semantic embedding lookup)
     - Pooled ROI features (for graph message passing)
 
     Subclasses must implement:
@@ -132,7 +127,6 @@ class SGGDetector(nn.Module, ABC):
             - boxes: List of (N_i, 4) detection boxes per image
             - labels: List of (N_i,) predicted class indices
             - scores: List of (N_i,) confidence scores
-            - logits: List of (N_i, num_classes) raw classification logits
             - roi_features: (total_boxes, C, H, W) pooled features
         """
         ...
