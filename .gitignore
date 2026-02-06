@@ -9,11 +9,18 @@ wheels/
 # Virtual environments
 .venv
 
+# large files
 datasets/*
 !.gitkeep
 .*_cache
+checkpoints/*
+!.gitkeep
 
+# claude
 .claude
 CLAUDE.md
 
 *.pdf
+
+# logs
+.aim/

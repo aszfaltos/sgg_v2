@@ -116,8 +116,27 @@ class SGGDetector(nn.Module, ABC):
         ...
 
     @abstractmethod
-    def forward(self, images: Tensor) -> SGGDetectorOutput:
-        """Run detection on images.
+    def forward(
+        self, images: Tensor, targets: list[dict[str, Any]]
+    ) -> dict[str, Tensor]:
+        """Training forward pass - compute losses.
+
+        Args:
+            images: (B, 3, H, W) batch of RGB images, values in [0, 1].
+            targets: List of target dicts. Each dict should contain
+                "boxes" (N, 4) and "labels" (N,) tensors.
+
+        Returns:
+            Dict of losses (e.g., loss_classifier, loss_box_reg, etc.)
+
+        Raises:
+            RuntimeError: If detector is not in trainable mode.
+        """
+        ...
+
+    @abstractmethod
+    def predict(self, images: Tensor) -> SGGDetectorOutput:
+        """Inference forward pass - get detections.
 
         Args:
             images: (B, 3, H, W) batch of RGB images, values in [0, 1].

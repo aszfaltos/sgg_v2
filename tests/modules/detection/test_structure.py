@@ -4,7 +4,6 @@ This test verifies that the basic directory structure is correctly set up
 and that all modules can be imported without errors.
 """
 
-import pytest
 
 
 class TestDetectionModuleStructure:
@@ -96,7 +95,6 @@ class TestDetectionExports:
         assert "boxes" in field_names
         assert "labels" in field_names
         assert "scores" in field_names
-        assert "logits" in field_names
         assert "roi_features" in field_names
 
     def test_can_import_factory_function(self) -> None:

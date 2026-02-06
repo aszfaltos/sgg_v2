@@ -9,8 +9,10 @@ dependencies = [
     "h5py>=3.15.1",
     "optuna>=4.7.0",
     "pytorch-lightning>=2.6.1",
+    "tensorboard>=2.20.0",
     "timm>=1.0.0",
     "torch>=2.5.0",
+    "torchmetrics>=1.0.0",
     "torchvision>=0.20.0",
 ]
 
@@ -24,3 +26,11 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = "."
 testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.13"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+explicit_package_bases = true

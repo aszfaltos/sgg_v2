@@ -4,7 +4,6 @@ Tests verify that all configuration dictionaries contain required keys
 and have appropriate default values for instantiating detectors.
 """
 
-import pytest
 
 from src.modules.detection.configs.defaults import (
     EFFICIENTDET_D2,
