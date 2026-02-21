@@ -346,7 +346,13 @@ def _collate_fn_pad(
         pad_h = max_h - h
         pad_w = max_w - w
         # Pad: (left, right, top, bottom)
-        padded = F.pad(img, (0, pad_w, 0, pad_h), mode="constant", value=0)
+        NORMALIZED_BLACK = torch.tensor([
+            -0.485 / 0.229,  # -2.12
+            -0.456 / 0.224,  # -2.04
+            -0.406 / 0.225,  # -1.80
+        ]).view(3, 1, 1)
+        padded = NORMALIZED_BLACK.expand(3, max_h, max_w).clone()
+        padded[:, :h, :w] = img
         padded_images.append(padded)
 
     # Stack into batch tensor

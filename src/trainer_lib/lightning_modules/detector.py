@@ -90,12 +90,14 @@ class DetectorLightningModule(LightningModule):
         debug_images_dir: str | Path | None = None,
         num_debug_images: int = 5,
         class_names: list[str] | None = None,
+        backbone_lr_factor: float = 1.0,
+        trainable_backbone_layers: int = 2,
     ) -> None:
         """Initialize the detector Lightning module.
 
         Args:
             model: Detection model (SGGFasterRCNN or SGGEfficientDet).
-            learning_rate: Base learning rate.
+            learning_rate: Base learning rate (used for heads).
             weight_decay: L2 weight regularization.
             warmup_epochs: Number of warmup epochs (linear warmup then cosine decay).
             debug_images_dir: Directory to save debug visualization images. If None,
@@ -104,6 +106,12 @@ class DetectorLightningModule(LightningModule):
             class_names: List of class names for debug visualization. If None, shows
                 numeric labels. Index 0 = first class (0-indexed for predictions,
                 but ground truth labels are 1-indexed so subtract 1).
+            backbone_lr_factor: Multiplier for backbone learning rate relative to
+                learning_rate. E.g., 0.1 means backbone trains at 10% of head LR.
+                Useful for finetuning where backbone is already pretrained.
+            trainable_backbone_layers: Number of backbone layers to train from the end.
+                E.g., 2 means train last 2 blocks, freeze earlier ones. Set to -1 to
+                train all backbone layers. EfficientNet-B0 has 7 blocks (0-6).
         """
         super().__init__()
 
@@ -114,6 +122,8 @@ class DetectorLightningModule(LightningModule):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.warmup_epochs = warmup_epochs
+        self.backbone_lr_factor = backbone_lr_factor
+        self.trainable_backbone_layers = trainable_backbone_layers
 
         # Debug visualization
         self.debug_images_dir = Path(debug_images_dir) if debug_images_dir else None
@@ -298,8 +308,8 @@ class DetectorLightningModule(LightningModule):
                     continue
                 x1, y1, x2, y2 = box.tolist()
                 draw.rectangle([x1, y1, x2, y2], outline="green", width=2)
-                # Pred labels are 0-indexed
-                label_idx = int(label)
+                # Pred labels are 1-indexed (same as GT), convert for class_names lookup
+                label_idx = int(label) - 1
                 if self.class_names and 0 <= label_idx < len(self.class_names):
                     label_str = f"{self.class_names[label_idx]} {score:.2f}"
                 else:
@@ -360,20 +370,114 @@ class DetectorLightningModule(LightningModule):
         self.val_predictions = []
         self.val_targets = []
 
+    def _get_parameter_groups(self) -> list[dict[str, Any]]:
+        """Get parameter groups with different learning rates for backbone vs heads.
+
+        Freezes early backbone layers based on trainable_backbone_layers setting.
+        For EfficientNet, blocks are numbered 0-6, so trainable_backbone_layers=2
+        means only blocks 5 and 6 are trainable.
+
+        Returns:
+            List of parameter group dicts for optimizer.
+        """
+        import re
+
+        backbone_params = []
+        head_params = []
+        frozen_count = 0
+
+        # Get the underlying model (unwrap from SGGDetector)
+        inner_model = self.model.model
+
+        # Find total number of backbone blocks (for EfficientNet)
+        total_blocks = 0
+        if hasattr(inner_model, "backbone") and hasattr(inner_model.backbone, "blocks"):
+            total_blocks = len(inner_model.backbone.blocks)
+
+        # Calculate which blocks to freeze
+        # trainable_backbone_layers=2 with 7 blocks means freeze blocks 0-4, train 5-6
+        if self.trainable_backbone_layers >= 0 and total_blocks > 0:
+            freeze_until_block = total_blocks - self.trainable_backbone_layers
+        else:
+            freeze_until_block = -1  # Don't freeze any blocks
+
+        for name, param in inner_model.named_parameters():
+            # Check if this is a backbone parameter
+            is_backbone = "backbone" in name
+
+            if is_backbone:
+                # Check block number from name (e.g., "backbone.blocks.3.conv")
+                block_match = re.search(r"backbone\.blocks\.(\d+)", name)
+                if block_match:
+                    block_num = int(block_match.group(1))
+                    # Freeze early blocks
+                    if block_num < freeze_until_block:
+                        param.requires_grad = False
+                        frozen_count += 1
+                        continue
+                elif freeze_until_block > 0:
+                    # Non-block backbone params (conv_stem, bn1) - freeze them too
+                    param.requires_grad = False
+                    frozen_count += 1
+                    continue
+
+            if not param.requires_grad:
+                continue
+
+            # Categorize trainable params
+            # FPN is part of "head" for LR purposes (needs to adapt to new classes)
+            is_backbone_trainable = "backbone" in name
+            is_fpn = "fpn" in name
+
+            if is_backbone_trainable and not is_fpn:
+                backbone_params.append(param)
+            else:
+                head_params.append(param)
+
+        if frozen_count > 0:
+            print(f"  Frozen {frozen_count} backbone parameters (blocks 0-{freeze_until_block - 1})")
+
+        # Create parameter groups
+        param_groups = []
+
+        if backbone_params:
+            param_groups.append({
+                "params": backbone_params,
+                "lr": self.learning_rate * self.backbone_lr_factor,
+                "name": "backbone",
+            })
+
+        if head_params:
+            param_groups.append({
+                "params": head_params,
+                "lr": self.learning_rate,
+                "name": "head",
+            })
+
+        return param_groups
+
     def configure_optimizers(  # type: ignore[override]
         self,
     ) -> dict[str, Union[Optimizer, dict[str, Any]]]:
         """Configure optimizer and learning rate scheduler.
 
         Uses linear warmup (1% to 100% over warmup_epochs) followed by
-        cosine annealing to 0 for the remaining epochs.
+        cosine annealing to 0 for the remaining epochs. Supports different
+        learning rates for backbone vs heads via backbone_lr_factor.
 
         Returns:
             Dict with optimizer and lr_scheduler config.
         """
+        # Get parameter groups with differential LR
+        param_groups = self._get_parameter_groups()
+
+        # Log parameter group info
+        for pg in param_groups:
+            n_params = sum(p.numel() for p in pg["params"])
+            print(f"  {pg['name']}: {n_params:,} params, lr={pg['lr']:.2e}")
+
         optimizer = AdamW(
-            self.model.parameters(),
-            lr=self.learning_rate,
+            param_groups,
             weight_decay=self.weight_decay,
         )
 

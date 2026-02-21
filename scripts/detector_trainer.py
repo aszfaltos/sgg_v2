@@ -412,6 +412,8 @@ def main(
         debug_images_dir=debug_images_dir,
         num_debug_images=5,
         class_names=class_names,
+        backbone_lr_factor=0.1,  # Backbone at 10% of head LR (already pretrained)
+        trainable_backbone_layers=-1,  # Train all backbone layers
     )
     print(f"Lightning module created (debug images: {debug_images_dir})")
     print()
@@ -460,6 +462,7 @@ def main(
         callbacks=callbacks,
         precision="16-mixed" if torch.cuda.is_available() else "32",  # Mixed precision on GPU
         gradient_clip_val=1.0,  # Gradient clipping for stability
+        accumulate_grad_batches=8,  # Effective batch size = 4 * 4 = 16
         log_every_n_steps=10,
         check_val_every_n_epoch=5,
         enable_model_summary=True,

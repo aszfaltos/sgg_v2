@@ -325,9 +325,13 @@ class SGGEfficientDet(SGGDetector):
         converted_targets = []
         for target in targets:
             if "boxes" in target and "bbox" not in target:
-                # Torchvision format -> effdet format
+                # Torchvision format (XYXY) -> effdet format (YXYX)
+                # effdet internally uses YXYX: [y_min, x_min, y_max, x_max]
+                # torchvision uses XYXY: [x_min, y_min, x_max, y_max]
+                boxes_xyxy = target["boxes"]
+                boxes_yxyx = boxes_xyxy[:, [1, 0, 3, 2]]
                 converted = {
-                    "bbox": target["boxes"],
+                    "bbox": boxes_yxyx,
                     "cls": target["labels"],
                     "img_scale": target.get(
                         "img_scale", torch.tensor(1.0, device=target["boxes"].device)
@@ -426,8 +430,9 @@ class SGGEfficientDet(SGGDetector):
             mask = scores >= self._score_thresh
 
             boxes = det[mask, :4]  # [N, 4] xyxy format
-            # effdet outputs 1-indexed labels [1, N], convert to 0-indexed [0, N-1]
-            labels = det[mask, 5].long() - 1
+            # effdet outputs 1-indexed labels [1, N], keep as-is to match
+            # dataloader targets (background_class=True → 1-indexed [1, N])
+            labels = det[mask, 5].long()
             scores = det[mask, 4]  # [N] confidence scores
 
             # Clip boxes to image bounds
