@@ -22,7 +22,7 @@ Usage:
         --embeddings datasets/vrd/embeddings/word2vec-google-news-300_objects.pt \\
         --num-predicates 70
 
-    # Train on predicted boxes (end-to-end training), test on both
+    # Train on predicted boxes (end-to-end training), val/test on pred
     uv run python scripts/sgg_trainer.py \\
         --head nmp \\
         --gt-train-h5 datasets/vrd/features/efficientdet_d0/gt_train.h5 \\
@@ -32,6 +32,17 @@ Usage:
         --embeddings datasets/vrd/embeddings/word2vec-google-news-300_objects.pt \\
         --num-predicates 70 \\
         --train-source pred
+
+    # Train on GT + pred boxes (hybrid), val/test on pred (end-to-end)
+    uv run python scripts/sgg_trainer.py \\
+        --head nmp \\
+        --gt-train-h5 datasets/vrd/features/efficientdet_d0/gt_train.h5 \\
+        --pred-train-h5 datasets/vrd/features/efficientdet_d0/pred_train.h5 \\
+        --gt-test-h5 datasets/vrd/features/efficientdet_d0/gt_test.h5 \\
+        --pred-test-h5 datasets/vrd/features/efficientdet_d0/pred_test.h5 \\
+        --embeddings datasets/vrd/embeddings/word2vec-google-news-300_objects.pt \\
+        --num-predicates 70 \\
+        --train-source hybrid
 
     # GT-only evaluation (no predicted-box features available)
     uv run python scripts/sgg_trainer.py \\
@@ -70,6 +81,7 @@ _PROJECT_ROOT = Path(__file__).parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from src.modules.sgg_heads.imp import IMPHead  # noqa: E402
 from src.modules.sgg_heads.nmp import NMPHead  # noqa: E402
 from src.trainer_lib import (  # noqa: E402
     SGGLightningModule,
@@ -99,7 +111,7 @@ def parse_args() -> argparse.Namespace:
         "--head",
         type=str,
         required=True,
-        choices=["nmp"],
+        choices=["nmp", "imp"],
         help="SGG head architecture",
     )
     parser.add_argument(
@@ -112,15 +124,17 @@ def parse_args() -> argparse.Namespace:
         "--pred-train-h5",
         type=str,
         default=None,
-        help="Path to predicted-box training HDF5 file (required when --train-source pred)",
+        help="Path to predicted-box training HDF5 file (required when --train-source is "
+             "'pred' or 'hybrid')",
     )
     parser.add_argument(
         "--train-source",
         type=str,
         default="gt",
-        choices=["gt", "pred"],
-        help="Which box set to train on: 'gt' (oracle, default) or 'pred' (end-to-end). "
-             "--pred-train-h5 must be provided when using 'pred'.",
+        choices=["gt", "pred", "hybrid"],
+        help="Which box set to train on: 'gt' (oracle, GT boxes only, default), "
+             "'pred' (predicted boxes only, val on pred), or 'hybrid' (GT+pred concat, "
+             "val on pred). --pred-train-h5 required for 'pred' and 'hybrid'.",
     )
     parser.add_argument(
         "--gt-test-h5",
@@ -154,6 +168,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=512,
         help="Hidden dimension for head MLPs (default: 512)",
+    )
+    parser.add_argument(
+        "--num-iter",
+        type=int,
+        default=3,
+        help="Message passing iterations for IMP head (default: 3, ignored for NMP)",
     )
 
     # Batching
@@ -190,18 +210,29 @@ def parse_args() -> argparse.Namespace:
         help="Validation split ratio (default: 0.1 = 10%%)",
     )
 
-    # Dataset edge thresholds
+    # Dataset score filtering
     parser.add_argument(
-        "--dis-thresh",
+        "--score-thresh",
         type=float,
-        default=0.5,
-        help="Normalised centre-distance threshold for edges (default: 0.5)",
+        default=0.0,
+        help="Minimum detection score to include a predicted box at train/val/test time. "
+             "GT features are unaffected. 0.0 = keep all (default: 0.0)",
+    )
+
+    # Relation sampling
+    parser.add_argument(
+        "--num-pos",
+        type=int,
+        default=250,
+        help="Max positive (relation) edges sampled per training image. "
+             "0 = no limit (use all positive edges). (default: 250)",
     )
     parser.add_argument(
-        "--iou-thresh",
-        type=float,
-        default=0.1,
-        help="IoU threshold for edges (default: 0.1)",
+        "--num-neg",
+        type=int,
+        default=750,
+        help="Max negative (no-relation) edges sampled per training image. "
+             "0 = no limit. (default: 750)",
     )
 
     # Infrastructure
@@ -222,6 +253,11 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Path to checkpoint to resume training from",
+    )
+    parser.add_argument(
+        "--test-only",
+        action="store_true",
+        help="Skip training and run test evaluation only (requires --resume)",
     )
     parser.add_argument(
         "--seed",
@@ -250,15 +286,17 @@ def create_head(
     num_predicates: int,
     semantic_dim: int,
     d_hidden: int,
-) -> NMPHead:
+    num_iter: int = 3,
+) -> NMPHead | IMPHead:
     """Create SGG head from name and config.
 
     Args:
-        head: Head architecture name.
+        head: Head architecture name ("nmp" or "imp").
         roi_feature_dim: (C, H, W) shape of ROI features in the HDF5 file.
         num_predicates: Number of predicate classes.
         semantic_dim: Dimension of word embeddings.
         d_hidden: Hidden MLP dimension.
+        num_iter: Message passing iterations (IMP only).
 
     Returns:
         Configured SGGHead instance.
@@ -269,6 +307,14 @@ def create_head(
             num_predicates=num_predicates,
             semantic_dim=semantic_dim,
             d_hidden=d_hidden,
+        )
+    if head == "imp":
+        return IMPHead(
+            roi_feature_dim=roi_feature_dim,
+            num_predicates=num_predicates,
+            semantic_dim=semantic_dim,
+            d_hidden=d_hidden,
+            num_iter=num_iter,
         )
     raise ValueError(f"Unknown head: {head}")
 
@@ -300,24 +346,29 @@ def main(
     embeddings: str,
     num_predicates: int,
     d_hidden: int,
+    num_iter: int,
     max_objects: int,
     epochs: int,
     lr: float,
     embedding_lr: float,
     val_split: float,
-    dis_thresh: float,
-    iou_thresh: float,
+    score_thresh: float,
+    num_pos: int,
+    num_neg: int,
     num_workers: int,
     checkpoint_dir: str | None,
     resume: str | None,
+    test_only: bool,
     seed: int,
 ) -> None:
     """Train an SGG relation head on precomputed features."""
-    if train_source == "pred" and pred_train_h5 is None:
-        raise ValueError("--pred-train-h5 is required when --train-source pred")
+    if test_only and resume is None:
+        raise ValueError("--test-only requires --resume <checkpoint_path>")
 
-    train_h5 = gt_train_h5 if train_source == "gt" else pred_train_h5
-    assert train_h5 is not None  # guaranteed by check above
+    if train_source in ("pred", "hybrid") and pred_train_h5 is None:
+        raise ValueError(
+            f"--pred-train-h5 is required when --train-source is '{train_source}'"
+        )
 
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -326,7 +377,7 @@ def main(
     checkpoint_path = (
         Path(checkpoint_dir)
         if checkpoint_dir is not None
-        else generate_checkpoint_dir(head, gt_train_h5, train_source)
+        else generate_checkpoint_dir(head, str(gt_train_h5), train_source)
     )
     checkpoint_path.mkdir(parents=True, exist_ok=True)
 
@@ -336,7 +387,9 @@ def main(
     print("=" * 60)
     print(f"Head:            {head}")
     print(f"Train source:    {train_source}")
-    print(f"Train features:  {train_h5}")
+    print(f"GT train:        {gt_train_h5}")
+    if train_source in ("pred", "hybrid"):
+        print(f"Pred train:      {pred_train_h5}")
     print(f"GT test:         {gt_test_h5}")
     print(f"Pred test:       {pred_test_h5 or '(none)'}")
     print(f"Embeddings:      {embeddings}")
@@ -347,6 +400,7 @@ def main(
     print(f"LR (head):       {lr}")
     print(f"LR (embedding):  {embedding_lr}")
     print(f"Val split:       {val_split}")
+    print(f"Sampling:        pos={num_pos or 'all'}, neg={num_neg or 'all'} edges/image")
     print(f"Checkpoint dir:  {checkpoint_path}")
     if resume:
         print(f"Resume from:     {resume}")
@@ -363,8 +417,9 @@ def main(
     print()
 
     # --- Infer ROI feature dimensions ---
-    print(f"Reading ROI feature shape from {train_h5}...")
-    roi_feature_dim = infer_roi_feature_dim(train_h5)
+    # Always read from GT: feature shape is a detector property, same for GT and pred.
+    print(f"Reading ROI feature shape from {gt_train_h5}...")
+    roi_feature_dim = infer_roi_feature_dim(gt_train_h5)
     print(f"ROI feature dim: {roi_feature_dim}  (C={roi_feature_dim[0]}, H={roi_feature_dim[1]}, W={roi_feature_dim[2]})")
     print()
 
@@ -376,6 +431,7 @@ def main(
         num_predicates=num_predicates,
         semantic_dim=semantic_dim,
         d_hidden=d_hidden,
+        num_iter=num_iter,
     )
     n_params = sum(p.numel() for p in sgg_head.parameters())
     print(f"Head parameters: {n_params:,}")
@@ -384,14 +440,17 @@ def main(
     # --- Create DataModule ---
     print("Creating DataModule...")
     datamodule = SGGPrecomputedDataModule(
-        train_h5=train_h5,
+        gt_train_h5=gt_train_h5,
         gt_test_h5=gt_test_h5,
+        pred_train_h5=pred_train_h5,
         pred_test_h5=pred_test_h5,
+        train_source=train_source,
         max_objects=max_objects,
         val_split=val_split,
         num_workers=num_workers,
-        dis_thresh=dis_thresh,
-        iou_thresh=iou_thresh,
+        score_thresh=score_thresh,
+        num_pos_per_image=num_pos,
+        num_neg_per_image=num_neg,
         seed=seed,
     )
     print("DataModule created")
@@ -461,20 +520,24 @@ def main(
     print()
 
     # --- Train ---
-    print("Starting training...")
-    print("=" * 60)
-    trainer.fit(
-        lightning_module,
-        datamodule=datamodule,
-        ckpt_path=resume,
-    )
-    print("=" * 60)
-    print()
+    if not test_only:
+        print("Starting training...")
+        print("=" * 60)
+        trainer.fit(
+            lightning_module,
+            datamodule=datamodule,
+            ckpt_path=resume,
+        )
+        print("=" * 60)
+        print()
 
-    print("Training complete!")
-    print(f"Best checkpoint: {checkpoint_path / 'best.ckpt'}")
-    print(f"Last checkpoint: {checkpoint_path / 'last.ckpt'}")
-    print()
+        print("Training complete!")
+        print(f"Best checkpoint: {checkpoint_path / 'best.ckpt'}")
+        print(f"Last checkpoint: {checkpoint_path / 'last.ckpt'}")
+        print()
+
+    # Resolve checkpoint path for test
+    test_ckpt = resume if test_only else "best"
 
     # --- Test (two separate passes to avoid Lightning multi-DL display artifact) ---
     print("Running final evaluation on test set...")
@@ -485,7 +548,7 @@ def main(
     print("=" * 60)
     print("  GT boxes (oracle)")
     lightning_module.test_prefix = "test_gt"
-    trainer.test(lightning_module, dataloaders=test_loaders[0], ckpt_path="best")
+    trainer.test(lightning_module, dataloaders=test_loaders[0], ckpt_path=test_ckpt)
     print("=" * 60)
     print()
 
@@ -494,7 +557,7 @@ def main(
         print("=" * 60)
         print("  Predicted boxes (end-to-end)")
         lightning_module.test_prefix = "test_pred"
-        trainer.test(lightning_module, dataloaders=test_loaders[1], ckpt_path="best")
+        trainer.test(lightning_module, dataloaders=test_loaders[1], ckpt_path=test_ckpt)
         print("=" * 60)
         print()
 
@@ -515,15 +578,18 @@ if __name__ == "__main__":
         embeddings=args.embeddings,
         num_predicates=args.num_predicates,
         d_hidden=args.d_hidden,
+        num_iter=args.num_iter,
         max_objects=args.max_objects,
         epochs=args.epochs,
         lr=args.lr,
         embedding_lr=args.embedding_lr,
         val_split=args.val_split,
-        dis_thresh=args.dis_thresh,
-        iou_thresh=args.iou_thresh,
+        score_thresh=args.score_thresh,
+        num_pos=args.num_pos,
+        num_neg=args.num_neg,
         num_workers=args.num_workers,
         checkpoint_dir=args.checkpoint_dir,
         resume=args.resume,
+        test_only=args.test_only,
         seed=args.seed,
     )

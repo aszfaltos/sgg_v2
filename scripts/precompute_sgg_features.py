@@ -145,6 +145,14 @@ def parse_args() -> argparse.Namespace:
         help="Min IoU for matching predicted boxes to GT boxes when carrying over "
              "GT relation labels (pred features only, default: 0.3)",
     )
+    parser.add_argument(
+        "--min-score",
+        type=float,
+        default=0.01,
+        help="Minimum detection score threshold for predicted boxes "
+             "(default: 0.01, matching reference SCORE_THRESH=0.01). "
+             "Lower values keep more boxes and improve GT relation coverage.",
+    )
 
     return parser.parse_args()
 
@@ -205,6 +213,7 @@ def create_frozen_detector(
     variant: str | None,
     checkpoint: str,
     num_classes: int,
+    min_score: float = 0.01,
 ) -> SGGDetector:
     """Create a frozen detector with loaded checkpoint weights.
 
@@ -212,6 +221,11 @@ def create_frozen_detector(
     Creates with trainable=True to match checkpoint structure (Lightning
     saves both bench_train and bench_predict for EfficientDet), then
     freezes after loading.
+
+    Args:
+        min_score: Minimum detection score for predicted boxes (applied at
+            inference time). Faster R-CNN uses ``min_score``, EfficientDet
+            uses ``score_thresh`` — mapped automatically by detector type.
     """
     # Build detector with trainable=True to match checkpoint structure.
     # Lightning checkpoints from DetectorLightningModule save the full
@@ -225,9 +239,11 @@ def create_frozen_detector(
     if detector == "fasterrcnn":
         if backbone:
             kwargs["backbone"] = backbone
+        kwargs["min_score"] = min_score
     elif detector == "efficientdet":
         if variant:
             kwargs["variant"] = variant
+        kwargs["score_thresh"] = min_score
     else:
         raise ValueError(f"Unknown detector: {detector}")
 
@@ -537,12 +553,17 @@ def process_predicted(
     tensors and no relation dataset.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    total_detections = 0
     total_matched_rels = 0
     idx = 0
 
+    # Per-image tracking for box count and GT box recall
+    pred_box_counts: list[int] = []    # predicted boxes per image
+    gt_box_counts: list[int] = []      # GT boxes per image
+    matched_gt_counts: list[int] = []  # GT boxes covered by ≥1 pred box at relation_iou_thresh
+
     with h5py.File(output_path, "w") as f:
-        for images, _targets in tqdm(loader, desc="Predicted features"):
+        pbar = tqdm(loader, desc="Predicted features")
+        for images, _targets in pbar:
             images = images.to(device)
             batch_size = images.shape[0]
 
@@ -553,26 +574,45 @@ def process_predicted(
             for i in range(batch_size):
                 img_id = image_ids[idx]
                 idx += 1
-                n_i = output.boxes[i].shape[0]
-                roi_i = output.roi_features[offset : offset + n_i]
+                n_pred = output.boxes[i].shape[0]
+                roi_i = output.roi_features[offset : offset + n_pred]
                 pred_boxes_i = output.boxes[i].cpu()
-                offset += n_i
+                offset += n_pred
 
-                # Match GT relations to predicted box indices
+                # Always parse GT boxes — needed for box recall even when no rels
                 ann = raw_annotations.get(img_id, [])
-                matched_rels: Tensor | None = None
-                if ann and pred_boxes_i.shape[0] > 0:
+                if ann:
                     gt_boxes_i, _, gt_rels_i = parse_gt_annotations(
                         ann, background_class
                     )
-                    if gt_boxes_i.shape[0] > 0 and gt_rels_i.shape[0] > 0:
-                        matched_rels = match_relations_to_predictions(
-                            pred_boxes_i,
-                            gt_boxes_i,
-                            gt_rels_i,
-                            iou_thresh=relation_iou_thresh,
-                        )
-                        total_matched_rels += matched_rels.shape[0]
+                else:
+                    gt_boxes_i = torch.zeros(0, 4, dtype=torch.float32)
+                    gt_rels_i = torch.zeros(0, 3, dtype=torch.int64)
+
+                n_gt = gt_boxes_i.shape[0]
+
+                # GT box recall: how many GT boxes have IoU >= thresh with any pred box
+                n_matched_gt = 0
+                if n_gt > 0 and n_pred > 0:
+                    iou = box_iou(gt_boxes_i, pred_boxes_i)  # (n_gt, n_pred)
+                    n_matched_gt = int(
+                        (iou.max(dim=1).values >= relation_iou_thresh).sum().item()
+                    )
+
+                pred_box_counts.append(n_pred)
+                gt_box_counts.append(n_gt)
+                matched_gt_counts.append(n_matched_gt)
+
+                # Relation matching
+                matched_rels: Tensor | None = None
+                if gt_rels_i.shape[0] > 0 and n_pred > 0:
+                    matched_rels = match_relations_to_predictions(
+                        pred_boxes_i,
+                        gt_boxes_i,
+                        gt_rels_i,
+                        iou_thresh=relation_iou_thresh,
+                    )
+                    total_matched_rels += matched_rels.shape[0]
 
                 save_image_to_hdf5(
                     f,
@@ -583,7 +623,15 @@ def process_predicted(
                     scores=output.scores[i].cpu(),
                     relations=matched_rels if (matched_rels is not None and matched_rels.shape[0] > 0) else None,
                 )
-                total_detections += n_i
+
+            # Update tqdm postfix with running stats after each batch
+            total_gt_so_far = sum(gt_box_counts)
+            running_recall = sum(matched_gt_counts) / max(total_gt_so_far, 1) * 100
+            avg_pred = sum(pred_box_counts) / max(len(pred_box_counts), 1)
+            pbar.set_postfix(
+                pred_boxes=f"{avg_pred:.1f}",
+                box_recall=f"{running_recall:.1f}%",
+            )
 
         write_metadata(
             f,
@@ -596,12 +644,39 @@ def process_predicted(
             background_class=background_class,
         )
 
+    # Final statistics
+    total_pred = sum(pred_box_counts)
+    total_gt = sum(gt_box_counts)
+    total_matched = sum(matched_gt_counts)
+    avg_pred_per_img = total_pred / max(idx, 1)
+    avg_gt_per_img = total_gt / max(idx, 1)
+    overall_box_recall = total_matched / max(total_gt, 1)
+    avg_matched_rels = total_matched_rels / max(idx, 1)
+
+    # Per-image recall (only images that have GT boxes)
+    per_img_recall = [m / g for m, g in zip(matched_gt_counts, gt_box_counts) if g > 0]
+    mean_per_img_recall = sum(per_img_recall) / max(len(per_img_recall), 1)
+    n_zero = sum(1 for r in per_img_recall if r == 0.0)
+    n_full = sum(1 for r in per_img_recall if r == 1.0)
+
+    # Box count percentiles
+    sorted_pred = sorted(pred_box_counts)
+    n = len(sorted_pred)
+
+    def _pct(p: int) -> int:
+        return sorted_pred[min(int(n * p / 100), n - 1)] if n else 0
+
     size_mb = output_path.stat().st_size / (1024 * 1024)
-    avg_det = total_detections / max(idx, 1)
-    avg_rel = total_matched_rels / max(idx, 1)
-    print(f"  Saved {idx} images ({total_detections} detections, avg {avg_det:.1f}/img)")
-    print(f"  Matched GT relations: {total_matched_rels} (avg {avg_rel:.1f}/img)")
-    print(f"  File: {output_path} ({size_mb:.1f} MB)")
+    print(f"\n  Predicted boxes per image:")
+    print(f"    avg={avg_pred_per_img:.1f}  min={_pct(0)}  p25={_pct(25)}  "
+          f"median={_pct(50)}  p75={_pct(75)}  max={_pct(100)}")
+    print(f"\n  GT box recall (IoU >= {relation_iou_thresh}):")
+    print(f"    GT boxes total:    {total_gt} (avg {avg_gt_per_img:.1f}/img)")
+    print(f"    Matched GT boxes:  {total_matched}/{total_gt} overall ({overall_box_recall*100:.1f}%)")
+    print(f"    Per-image recall:  mean {mean_per_img_recall*100:.1f}%"
+          f"  |  0%: {n_zero} imgs  |  100%: {n_full} imgs")
+    print(f"\n  Matched GT relations: {total_matched_rels} (avg {avg_matched_rels:.1f}/img)")
+    print(f"  Saved {idx} images → {output_path} ({size_mb:.1f} MB)")
 
 
 def process_gt(
@@ -712,6 +787,7 @@ def main(
     num_classes: int,
     max_images: int | None,
     relation_iou_thresh: float = 0.3,
+    min_score: float = 0.01,
 ) -> None:
     """Run feature precomputation."""
     background_class = True
@@ -746,7 +822,7 @@ def main(
     # Create detector
     print(f"Loading detector: {det_name} (checkpoint: {checkpoint})")
     model = create_frozen_detector(
-        detector_type, backbone, variant, checkpoint, num_classes
+        detector_type, backbone, variant, checkpoint, num_classes, min_score=min_score
     )
     model = model.to(device)
     print(f"  ROI feature dim: {model.roi_feature_dim}")
@@ -827,4 +903,5 @@ if __name__ == "__main__":
         num_classes=args.num_classes,
         max_images=args.max_images,
         relation_iou_thresh=args.relation_iou_thresh,
+        min_score=args.min_score,
     )

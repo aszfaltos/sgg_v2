@@ -56,7 +56,7 @@ class NMPHead(SGGHead):
         >>> head = NMPHead(roi_feature_dim=(256, 7, 7), num_predicates=70)
         >>> embedding = torch.randn(101, 300)  # GloVe, 100 VRD classes + background
         >>> out = head(batch, embedding)
-        >>> out.rel_logits[0].shape  # (E_0, 70)
+        >>> out.rel_logits[0].shape  # (E_0, 71)  — 70 predicates + 1 background
     """
 
     _GEO_DIM: int = 12  # output dim of compute_geometric_encoding
@@ -93,7 +93,8 @@ class NMPHead(SGGHead):
         self._f_fusion = _make_mlp(2 * d_hidden, d_hidden)
 
         # Classifier — appends spatial lᵢⱼ at classification time (NMP paper design)
-        self._rel_classifier = nn.Linear(d_hidden + self._GEO_DIM, num_predicates)
+        # Output: num_predicates + 1 classes (index 0 = no-relation background)
+        self._rel_classifier = nn.Linear(d_hidden + self._GEO_DIM, num_predicates + 1)
 
     @property
     def num_predicates(self) -> int:
@@ -135,7 +136,7 @@ class NMPHead(SGGHead):
         if total_N == 0 or total_E == 0:
             B = node_counts.shape[0]
             empty_logits = [
-                torch.zeros(0, self._num_predicates, device=roi_features.device)
+                torch.zeros(0, self._num_predicates + 1, device=roi_features.device)
                 for _ in range(B)
             ]
             empty_idx = [
@@ -177,7 +178,7 @@ class NMPHead(SGGHead):
         # -- Step 8: classify with precomputed geo features ---------------
         logits = self._rel_classifier(
             torch.cat([e_fused, geo], dim=-1)
-        )  # (total_E, num_predicates)
+        )  # (total_E, num_predicates + 1); index 0 = background/no-relation
 
         # -- Step 9: split back to per-image lists ------------------------
         # logits and edge indices split by edge_counts

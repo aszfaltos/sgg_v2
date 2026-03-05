@@ -56,9 +56,10 @@ class SGGLightningModule(LightningModule):
         eval_k: Top-K cutoffs for R@K and mR@K metrics.
 
     Note:
-        Loss is computed only on positive edges (edges with a GT relation).
-        No-relation edges (rel_label == 0) are ignored. This matches the
-        NMPHead output shape (num_predicates classes, no background logit).
+        Loss is computed over all edges. No-relation edges (rel_label == 0)
+        map to the background class (logit index 0) and contribute gradient,
+        penalising the model for assigning high scores to unrelated pairs.
+        SGGHead subclasses output num_predicates + 1 logits (index 0 = background).
 
         For test evaluation, set `test_prefix` before each `trainer.test()`
         call to control the metric namespace ("test_gt" or "test_pred").
@@ -123,17 +124,17 @@ class SGGLightningModule(LightningModule):
         """
         output = self.model(batch, self.embedding)
 
-        # Concatenate logits from all images: (total_E, num_predicates)
+        # Concatenate logits from all images: (total_E, num_predicates + 1)
         all_logits = torch.cat(output.rel_logits)
-        # Shift labels: 0=no_rel → -1 (ignore_index), 1..num_pred → 0-indexed
-        all_labels = batch["rel_labels"] - 1  # (total_E,), -1=no relation
+        # Labels: 0=no_rel (background), 1..num_pred=predicate (1-indexed)
+        all_labels = batch["rel_labels"]  # (total_E,)
 
-        # Skip batches with no positive edges to avoid NaN (cross_entropy
-        # returns 0/0=NaN when every label is the ignore_index).
-        if not (all_labels >= 0).any():
+        # Skip empty batches (no edges at all)
+        if all_logits.shape[0] == 0:
             return torch.tensor(0.0, device=all_logits.device, requires_grad=True)
 
-        loss = F.cross_entropy(all_logits, all_labels, ignore_index=-1)
+        # All edges contribute: negatives learn to predict background (class 0)
+        loss = F.cross_entropy(all_logits, all_labels)
 
         total_e = int(batch["rel_labels"].shape[0])
         self.log(

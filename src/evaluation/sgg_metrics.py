@@ -123,7 +123,7 @@ class SGGEvaluator:
 
     def _update_image(
         self,
-        logits: Tensor,     # (E_i, num_predicates)
+        logits: Tensor,     # (E_i, num_predicates + 1); index 0 = background
         sub_idx: Tensor,    # (E_i,) image-local
         obj_idx: Tensor,    # (E_i,) image-local
         rel_labels: Tensor, # (E_i,) 0=no_rel, 1..num_pred = predicate (1-indexed)
@@ -160,8 +160,9 @@ class SGGEvaluator:
         # predicate labels 1..n_pred, repeated for each edge
         pred_classes = torch.arange(1, n_pred + 1, device=logits.device).repeat(E_i)
 
-        # Flatten scores: (E_i, n_pred) → (E_i * n_pred,)
-        scores = logits.flatten()
+        # Skip background (index 0); rank by predicate scores only
+        # logits[:, 1:]: (E_i, n_pred) → (E_i * n_pred,)
+        scores = logits[:, 1:].flatten()
 
         for k in self._k_values:
             actual_k = min(k, scores.shape[0])
@@ -170,11 +171,11 @@ class SGGEvaluator:
             else:
                 topk_indices = torch.arange(scores.shape[0], device=scores.device)
 
-            # Build predicted triplet set from top-K indices
-            pred_triplets: set[tuple[int, int, int]] = {
-                (int(sub_expanded[i]), int(obj_expanded[i]), int(pred_classes[i]))
-                for i in topk_indices.tolist()
-            }
+            # Gather top-K elements in one shot, convert to Python lists once
+            top_subs = sub_expanded[topk_indices].tolist()
+            top_objs = obj_expanded[topk_indices].tolist()
+            top_preds = pred_classes[topk_indices].tolist()
+            pred_triplets: set[tuple[int, int, int]] = set(zip(top_subs, top_objs, top_preds))
 
             # Per-image recall
             hits = len(gt_triplets & pred_triplets)

@@ -5,30 +5,23 @@ from detected bounding boxes. Used by all SGG heads.
 """
 
 import torch
-import torchvision.ops
 from torch import Tensor
 
 
-def build_edge_index(
-    boxes: Tensor,
-    dis_thresh: float = 0.5,
-    iou_thresh: float = 0.1,
-) -> tuple[Tensor, Tensor]:
-    """Build directed edge index from detected boxes using spatial heuristics.
+def build_edge_index(boxes: Tensor) -> tuple[Tensor, Tensor]:
+    """Build all directed edges between N detected boxes.
 
-    An edge exists between i and j (i != j) when either:
-      - normalised centre distance < dis_thresh, OR
-      - IoU > iou_thresh
+    Returns all N*(N-1) directed pairs (i→j for i≠j).  This matches the
+    reference implementation which uses REQUIRE_BOX_OVERLAP=false for VRD/VG:
+    no spatial filtering is applied so the relation head sees every candidate
+    pair and learns which ones carry a relation.
 
     Args:
         boxes: (N, 4) xyxy absolute coordinates for one image.
-        dis_thresh: Distance threshold. Distance is normalised by sqrt(image area),
-            where image area is inferred as max_x * max_y from box extents.
-        iou_thresh: IoU threshold.
 
     Returns:
         Tuple of (subject_indices, object_indices), each (E,) int64.
-        Both are empty tensors of shape (0,) when N == 0 or no edges pass.
+        Both are empty tensors of shape (0,) when N == 0.
     """
     N = boxes.shape[0]
     device = boxes.device
@@ -37,15 +30,7 @@ def build_edge_index(
         empty = torch.zeros(0, dtype=torch.long, device=device)
         return empty, empty
 
-    # Normalised centre distances
-    centres = (boxes[:, :2] + boxes[:, 2:]) / 2  # (N, 2)
-    image_area = boxes[:, 2].max() * boxes[:, 3].max()
-    diff = centres.unsqueeze(0) - centres.unsqueeze(1)  # (N, N, 2)
-    dist = diff.norm(dim=-1) / image_area.sqrt().clamp(min=1e-6)  # (N, N)
-
-    iou = torchvision.ops.box_iou(boxes, boxes)  # (N, N)
-
-    mask = (dist < dis_thresh) | (iou > iou_thresh)  # (N, N)
+    mask = torch.ones(N, N, dtype=torch.bool, device=device)
     mask.fill_diagonal_(False)
 
     sub_idx, obj_idx = mask.nonzero(as_tuple=True)

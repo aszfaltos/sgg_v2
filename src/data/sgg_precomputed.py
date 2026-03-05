@@ -30,16 +30,19 @@ class SGGPrecomputedDataset(Dataset[dict[str, Tensor]]):
     """Dataset that loads precomputed SGG detector features from HDF5.
 
     Builds the candidate edge graph (edge index + geometric encoding + relation
-    labels) at __getitem__ time using spatial heuristics, enabling parallel
-    construction across DataLoader workers.
+    labels) at __getitem__ time, enabling parallel construction across DataLoader
+    workers.  All N*(N-1) directed pairs are used as candidate edges, matching
+    the reference implementation (REQUIRE_BOX_OVERLAP=false).
 
     The h5py file handle is opened lazily per-worker to avoid issues with
     h5py not being fork-safe across multiple worker processes.
 
     Args:
         h5_path: Path to the HDF5 feature file.
-        dis_thresh: Normalised centre-distance threshold for edge creation.
-        iou_thresh: IoU threshold for edge creation.
+        score_thresh: Minimum detection score to include a predicted box.
+            Applied at __getitem__ time so the threshold can be swept without
+            re-running precomputation.  GT features (no scores in HDF5) are
+            never filtered.  Default: 0.0 (keep all boxes).
 
     Returns (from __getitem__):
         roi_features: (N, C, H, W) float32
@@ -52,20 +55,24 @@ class SGGPrecomputedDataset(Dataset[dict[str, Tensor]]):
         rel_labels:   (E,)         int64, 0=no relation, 1-indexed predicate otherwise
 
     Properties:
-        node_counts: list[int] — number of objects per image, cached at init.
-            Used by MaxObjectsBatchSampler without opening the file per call.
+        node_counts: list[int] — number of objects per image, cached at init
+            from HDF5 shape (unfiltered).  Used by MaxObjectsBatchSampler; when
+            score_thresh > 0 the sampler is conservative (overestimates nodes)
+            but correct.
     """
 
     def __init__(
         self,
         h5_path: str | Path,
-        dis_thresh: float = 0.5,
-        iou_thresh: float = 0.1,
+        score_thresh: float = 0.0,
+        num_pos: int | None = None,
+        num_neg: int | None = None,
     ) -> None:
         super().__init__()
         self._h5_path = Path(h5_path)
-        self._dis_thresh = dis_thresh
-        self._iou_thresh = iou_thresh
+        self._score_thresh = score_thresh
+        self._num_pos = num_pos
+        self._num_neg = num_neg
 
         # Lazy file handle: opened once per worker in __getitem__
         self._file: h5py.File | None = None
@@ -85,7 +92,7 @@ class SGGPrecomputedDataset(Dataset[dict[str, Tensor]]):
 
     @property
     def node_counts(self) -> list[int]:
-        """Number of detected objects per image (cached at init)."""
+        """Number of detected objects per image (cached at init, unfiltered)."""
         return self._node_counts
 
     # ------------------------------------------------------------------
@@ -103,18 +110,50 @@ class SGGPrecomputedDataset(Dataset[dict[str, Tensor]]):
         boxes = torch.from_numpy(grp["boxes"][:])  # (N, 4)
         labels = torch.from_numpy(grp["labels"][:])  # (N,)
 
-        N = boxes.shape[0]
-
-        if "scores" in grp:
+        has_pred_scores = "scores" in grp
+        if has_pred_scores:
             scores = torch.from_numpy(grp["scores"][:])  # (N,)
         else:
-            scores = torch.zeros(N, dtype=torch.float32)
+            scores = torch.zeros(boxes.shape[0], dtype=torch.float32)
 
         relations: Tensor
         if "relations" in grp and grp["relations"].shape[0] > 0:
             relations = torch.from_numpy(grp["relations"][:])  # (R, 3)
         else:
             relations = torch.zeros(0, 3, dtype=torch.int64)
+
+        # -- Score filtering (pred features only) -------------------------
+        # GT features have no scores dataset; never filter them.
+        if self._score_thresh > 0.0 and has_pred_scores:
+            keep_mask = scores >= self._score_thresh
+            if keep_mask.any():
+                keep_idx = keep_mask.nonzero(as_tuple=False).squeeze(1)
+                # Build old→new index map for relation re-indexing
+                old_to_new = torch.full((boxes.shape[0],), -1, dtype=torch.long)
+                old_to_new[keep_idx] = torch.arange(keep_idx.shape[0], dtype=torch.long)
+
+                roi_features = roi_features[keep_mask]
+                boxes = boxes[keep_mask]
+                labels = labels[keep_mask]
+                scores = scores[keep_mask]
+
+                # Re-index relations: drop any where sub or obj was filtered out
+                if relations.shape[0] > 0:
+                    sub_new = old_to_new[relations[:, 0]]
+                    obj_new = old_to_new[relations[:, 1]]
+                    valid = (sub_new >= 0) & (obj_new >= 0)
+                    relations = torch.stack(
+                        [sub_new[valid], obj_new[valid], relations[valid, 2]], dim=1
+                    )
+            else:
+                # All boxes filtered out — treat as empty image
+                roi_features = roi_features[:0]
+                boxes = boxes[:0]
+                labels = labels[:0]
+                scores = scores[:0]
+                relations = relations[:0]
+
+        N = boxes.shape[0]
 
         # -- Handle empty image (N == 0) ----------------------------------
         if N == 0:
@@ -130,18 +169,8 @@ class SGGPrecomputedDataset(Dataset[dict[str, Tensor]]):
                 "rel_labels": empty_e,
             }
 
-        # -- Build edge index ---------------------------------------------
-        sub_idx, obj_idx = build_edge_index(boxes, self._dis_thresh, self._iou_thresh)
-
-        # -- Geometric encoding -------------------------------------------
-        if sub_idx.shape[0] > 0:
-            W = float(boxes[:, 2].max().item())
-            H = float(boxes[:, 3].max().item())
-            geo = compute_geometric_encoding(
-                boxes[sub_idx], boxes[obj_idx], (W, H)
-            )  # (E, 12)
-        else:
-            geo = torch.zeros(0, 12, dtype=torch.float32)
+        # -- Build edge index (all N*(N-1) directed pairs) ----------------
+        sub_idx, obj_idx = build_edge_index(boxes)
 
         # -- Relation labels ----------------------------------------------
         # relations: (R, 3) — [sub, obj, predicate (0-indexed)]
@@ -157,6 +186,33 @@ class SGGPrecomputedDataset(Dataset[dict[str, Tensor]]):
             key = (int(sub_idx[k].item()), int(obj_idx[k].item()))
             if key in rel_map:
                 rel_labels[k] = rel_map[key]
+
+        # -- Positive/negative edge sampling ------------------------------
+        if self._num_pos is not None or self._num_neg is not None:
+            pos_idx = (rel_labels > 0).nonzero(as_tuple=False).view(-1)
+            neg_idx = (rel_labels == 0).nonzero(as_tuple=False).view(-1)
+
+            if self._num_pos is not None and pos_idx.shape[0] > self._num_pos:
+                perm = torch.randperm(pos_idx.shape[0])
+                pos_idx = pos_idx[perm[: self._num_pos]]
+            if self._num_neg is not None and neg_idx.shape[0] > self._num_neg:
+                perm = torch.randperm(neg_idx.shape[0])
+                neg_idx = neg_idx[perm[: self._num_neg]]
+
+            keep, _ = torch.cat([pos_idx, neg_idx]).sort()
+            sub_idx = sub_idx[keep]
+            obj_idx = obj_idx[keep]
+            rel_labels = rel_labels[keep]
+
+        # -- Geometric encoding (computed after sampling for efficiency) ---
+        if sub_idx.shape[0] > 0:
+            W = float(boxes[:, 2].max().item())
+            H = float(boxes[:, 3].max().item())
+            geo = compute_geometric_encoding(
+                boxes[sub_idx], boxes[obj_idx], (W, H)
+            )  # (E, 12)
+        else:
+            geo = torch.zeros(0, 12, dtype=torch.float32)
 
         return {
             "roi_features": roi_features,

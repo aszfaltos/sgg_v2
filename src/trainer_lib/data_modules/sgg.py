@@ -15,12 +15,12 @@ from __future__ import annotations
 
 from itertools import accumulate
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from pytorch_lightning import LightningDataModule
 from torch import Tensor
-from torch.utils.data import DataLoader, Sampler, Subset, random_split
+from torch.utils.data import ConcatDataset, DataLoader, Sampler, Subset, random_split
 
 from src.data.sgg_precomputed import SGGPrecomputedDataset
 
@@ -175,6 +175,18 @@ def _subset_node_counts(subset: Subset) -> list[int]:  # type: ignore[type-arg]
     return [full.node_counts[i] for i in subset.indices]
 
 
+def _get_node_counts(ds: Any) -> list[int]:
+    """Extract node_counts from a Subset[SGGPrecomputedDataset] or ConcatDataset thereof."""
+    if isinstance(ds, Subset) and isinstance(ds.dataset, SGGPrecomputedDataset):
+        return _subset_node_counts(ds)
+    if isinstance(ds, ConcatDataset):
+        counts: list[int] = []
+        for sub in ds.datasets:
+            counts.extend(_get_node_counts(sub))
+        return counts
+    raise TypeError(f"Cannot extract node_counts from {type(ds)}")
+
+
 # ---------------------------------------------------------------------------
 # DataModule
 # ---------------------------------------------------------------------------
@@ -187,21 +199,42 @@ class SGGPrecomputedDataModule(LightningDataModule):
     head). Testing runs two loaders in sequence: GT boxes (oracle upper bound)
     and, optionally, predicted boxes (end-to-end performance).
 
+    Training uses one of three sources controlled by ``train_source``:
+
+    * ``"gt"``     — GT boxes only. Val uses GT. Measures relation head quality in
+                     isolation (PredCls upper bound).
+    * ``"pred"``   — Predicted boxes only. Val uses pred. Measures end-to-end SGDet
+                     performance.
+    * ``"hybrid"`` — Concatenates GT and pred training sets. Val uses pred, so
+                     metrics reflect whether hybrid training improves SGDet.
+
+    In all modes the val split indices are derived from the GT dataset (same image
+    ordering as pred), and the test loaders are unchanged (GT + optional pred).
+
     Args:
-        train_h5: Path to the GT training HDF5 feature file.
+        gt_train_h5: Path to the GT training HDF5 feature file. Always required;
+            also determines the canonical train/val split indices.
+        pred_train_h5: Path to the predicted-box training HDF5 file. Required when
+            ``train_source`` is ``"pred"`` or ``"hybrid"``.
+        train_source: Which box set(s) to train on (default: ``"gt"``).
         gt_test_h5: Path to the GT test HDF5 feature file (oracle evaluation).
         pred_test_h5: Path to the predicted-box test HDF5 file (end-to-end
             evaluation). If None, only GT test is run.
         max_objects: Maximum total objects (nodes) per batch.
         val_split: Fraction of training images to hold out for validation.
         num_workers: DataLoader worker count.
-        dis_thresh: Edge distance threshold passed to SGGPrecomputedDataset.
-        iou_thresh: Edge IoU threshold passed to SGGPrecomputedDataset.
+        score_thresh: Minimum detection score passed to SGGPrecomputedDataset.
+            GT features (no scores in HDF5) are unaffected.
+        num_pos_per_image: Max positive (relation) edges sampled per training image.
+            0 = no limit (use all positives). Default: 250 (matches reference).
+        num_neg_per_image: Max negative (no-relation) edges sampled per training image.
+            0 = no limit. Default: 750 (matches reference 1000 pairs at 25% pos rate).
+            Val/test datasets always use all edges regardless of these settings.
         seed: Random seed for train/val split and sampler shuffling.
 
     Example:
         >>> dm = SGGPrecomputedDataModule(
-        ...     train_h5="features/gt/train.h5",
+        ...     gt_train_h5="features/gt/train.h5",
         ...     gt_test_h5="features/gt/test.h5",
         ...     pred_test_h5="features/pred/test.h5",
         ...     max_objects=512,
@@ -213,28 +246,34 @@ class SGGPrecomputedDataModule(LightningDataModule):
 
     def __init__(
         self,
-        train_h5: str | Path,
+        gt_train_h5: str | Path,
         gt_test_h5: str | Path,
+        pred_train_h5: str | Path | None = None,
         pred_test_h5: str | Path | None = None,
+        train_source: Literal["gt", "pred", "hybrid"] = "gt",
         max_objects: int = 512,
         val_split: float = 0.1,
         num_workers: int = 4,
-        dis_thresh: float = 0.5,
-        iou_thresh: float = 0.1,
+        score_thresh: float = 0.0,
+        num_pos_per_image: int = 250,
+        num_neg_per_image: int = 750,
         seed: int = 42,
     ) -> None:
         super().__init__()
-        self._train_h5 = Path(train_h5)
+        self._gt_train_h5 = Path(gt_train_h5)
+        self._pred_train_h5 = Path(pred_train_h5) if pred_train_h5 is not None else None
+        self._train_source = train_source
         self._gt_test_h5 = Path(gt_test_h5)
         self._pred_test_h5 = Path(pred_test_h5) if pred_test_h5 is not None else None
         self._max_objects = max_objects
         self._val_split = val_split
         self._num_workers = num_workers
-        self._dis_thresh = dis_thresh
-        self._iou_thresh = iou_thresh
+        self._score_thresh = score_thresh
+        self._num_pos = num_pos_per_image if num_pos_per_image > 0 else None
+        self._num_neg = num_neg_per_image if num_neg_per_image > 0 else None
         self._seed = seed
 
-        self._train_subset: Subset | None = None  # type: ignore[type-arg]
+        self._train_ds: Subset | ConcatDataset | None = None  # type: ignore[type-arg]
         self._val_subset: Subset | None = None  # type: ignore[type-arg]
         self._gt_test_ds: SGGPrecomputedDataset | None = None
         self._pred_test_ds: SGGPrecomputedDataset | None = None
@@ -245,25 +284,57 @@ class SGGPrecomputedDataModule(LightningDataModule):
 
     def setup(self, stage: str | None = None) -> None:
         if stage in ("fit", None):
-            full_ds = SGGPrecomputedDataset(
-                self._train_h5, self._dis_thresh, self._iou_thresh
-            )
-            total = len(full_ds)
+            # gt_ds has no sampling — used for canonical split indices and GT val.
+            gt_ds = SGGPrecomputedDataset(self._gt_train_h5, self._score_thresh)
+            total = len(gt_ds)
             val_size = int(total * self._val_split)
             train_size = total - val_size
 
+            # Canonical split indices always come from GT dataset.
+            # Same indices are reused for pred dataset (same image ordering).
             generator = torch.Generator().manual_seed(self._seed)
-            subsets = random_split(full_ds, [train_size, val_size], generator=generator)
-            self._train_subset = subsets[0]
-            self._val_subset = subsets[1]
+            gt_train_sub, gt_val_sub = random_split(
+                gt_ds, [train_size, val_size], generator=generator
+            )
+            train_indices = list(gt_train_sub.indices)
+            val_indices = list(gt_val_sub.indices)
+
+            if self._train_source == "gt":
+                gt_ds_train = SGGPrecomputedDataset(
+                    self._gt_train_h5, self._score_thresh, self._num_pos, self._num_neg
+                )
+                self._train_ds = Subset(gt_ds_train, train_indices)
+                self._val_subset = Subset(gt_ds, val_indices)  # no sampling for val
+            else:
+                assert self._pred_train_h5 is not None
+                if self._train_source == "pred":
+                    pred_ds_train = SGGPrecomputedDataset(
+                        self._pred_train_h5, self._score_thresh, self._num_pos, self._num_neg
+                    )
+                    pred_ds_val = SGGPrecomputedDataset(self._pred_train_h5, self._score_thresh)
+                    self._train_ds = Subset(pred_ds_train, train_indices)
+                    self._val_subset = Subset(pred_ds_val, val_indices)
+                else:  # hybrid
+                    gt_ds_train = SGGPrecomputedDataset(
+                        self._gt_train_h5, self._score_thresh, self._num_pos, self._num_neg
+                    )
+                    pred_ds_train = SGGPrecomputedDataset(
+                        self._pred_train_h5, self._score_thresh, self._num_pos, self._num_neg
+                    )
+                    pred_ds_val = SGGPrecomputedDataset(self._pred_train_h5, self._score_thresh)
+                    self._train_ds = ConcatDataset([
+                        Subset(gt_ds_train, train_indices),
+                        Subset(pred_ds_train, train_indices),
+                    ])
+                    self._val_subset = Subset(pred_ds_val, val_indices)
 
         if stage in ("test", "predict", None):
             self._gt_test_ds = SGGPrecomputedDataset(
-                self._gt_test_h5, self._dis_thresh, self._iou_thresh
+                self._gt_test_h5, self._score_thresh
             )
             if self._pred_test_h5 is not None:
                 self._pred_test_ds = SGGPrecomputedDataset(
-                    self._pred_test_h5, self._dis_thresh, self._iou_thresh
+                    self._pred_test_h5, self._score_thresh
                 )
 
     # ------------------------------------------------------------------
@@ -271,11 +342,11 @@ class SGGPrecomputedDataModule(LightningDataModule):
     # ------------------------------------------------------------------
 
     def train_dataloader(self) -> DataLoader[Any]:
-        if self._train_subset is None:
+        if self._train_ds is None:
             raise RuntimeError("Call setup('fit') before train_dataloader()")
 
         sampler = MaxObjectsBatchSampler(
-            _subset_node_counts(self._train_subset),
+            _get_node_counts(self._train_ds),
             self._max_objects,
             shuffle=True,
             seed=self._seed,
@@ -283,7 +354,7 @@ class SGGPrecomputedDataModule(LightningDataModule):
         pin_memory = torch.cuda.is_available()
         persistent = self._num_workers > 0
         return DataLoader(
-            self._train_subset,
+            self._train_ds,
             batch_sampler=sampler,
             collate_fn=sgg_collate,
             num_workers=self._num_workers,
