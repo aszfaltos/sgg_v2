@@ -81,6 +81,7 @@ _PROJECT_ROOT = Path(__file__).parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from src.modules.sgg_heads.bgnn import BGNNHead  # noqa: E402
 from src.modules.sgg_heads.imp import IMPHead  # noqa: E402
 from src.modules.sgg_heads.nmp import NMPHead  # noqa: E402
 from src.trainer_lib import (  # noqa: E402
@@ -111,7 +112,7 @@ def parse_args() -> argparse.Namespace:
         "--head",
         type=str,
         required=True,
-        choices=["nmp", "imp"],
+        choices=["nmp", "imp", "bgnn"],
         help="SGG head architecture",
     )
     parser.add_argument(
@@ -173,7 +174,7 @@ def parse_args() -> argparse.Namespace:
         "--num-iter",
         type=int,
         default=3,
-        help="Message passing iterations for IMP head (default: 3, ignored for NMP)",
+        help="Message passing iterations for IMP/BGNN heads (default: 3 for IMP, 2 recommended for BGNN; ignored for NMP)",
     )
 
     # Batching
@@ -287,16 +288,16 @@ def create_head(
     semantic_dim: int,
     d_hidden: int,
     num_iter: int = 3,
-) -> NMPHead | IMPHead:
+) -> NMPHead | IMPHead | BGNNHead:
     """Create SGG head from name and config.
 
     Args:
-        head: Head architecture name ("nmp" or "imp").
+        head: Head architecture name ("nmp", "imp", or "bgnn").
         roi_feature_dim: (C, H, W) shape of ROI features in the HDF5 file.
         num_predicates: Number of predicate classes.
         semantic_dim: Dimension of word embeddings.
         d_hidden: Hidden MLP dimension.
-        num_iter: Message passing iterations (IMP only).
+        num_iter: Message passing iterations (IMP/BGNN only).
 
     Returns:
         Configured SGGHead instance.
@@ -310,6 +311,14 @@ def create_head(
         )
     if head == "imp":
         return IMPHead(
+            roi_feature_dim=roi_feature_dim,
+            num_predicates=num_predicates,
+            semantic_dim=semantic_dim,
+            d_hidden=d_hidden,
+            num_iter=num_iter,
+        )
+    if head == "bgnn":
+        return BGNNHead(
             roi_feature_dim=roi_feature_dim,
             num_predicates=num_predicates,
             semantic_dim=semantic_dim,

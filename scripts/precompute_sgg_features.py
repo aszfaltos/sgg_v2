@@ -58,6 +58,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 from src.data.vrd_detection import VRDDetectionDataset  # noqa: E402
 from src.modules.detection import create_detector  # noqa: E402
 from src.modules.detection.base import SGGDetector  # noqa: E402
+from src.modules.sgg_heads.utils.graph import build_edge_index, compute_union_boxes  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +153,13 @@ def parse_args() -> argparse.Namespace:
         help="Minimum detection score threshold for predicted boxes "
              "(default: 0.01, matching reference SCORE_THRESH=0.01). "
              "Lower values keep more boxes and improve GT relation coverage.",
+    )
+    parser.add_argument(
+        "--save-union-features",
+        action="store_true",
+        help="Also extract and save union-box ROI features for each candidate pair. "
+             "Required for BGNNHead. Stored as 'union_features' (E_full, C) per image "
+             "group, global-average-pooled. Significantly increases file size.",
     )
 
     return parser.parse_args()
@@ -464,6 +472,37 @@ def extract_gt_roi_features(
     raise TypeError(f"Unsupported detector type: {type(detector)}")
 
 
+def extract_union_roi_features(
+    detector: SGGDetector,
+    images: Tensor,
+    union_boxes: list[Tensor],
+) -> Tensor:
+    """Extract global-average-pooled ROI features at union box locations.
+
+    For each candidate pair (i, j) in an image, the union box is the tight
+    bounding box enclosing both objects.  Features are pooled and then
+    global-average-pooled to (E_total, C) — the spatial 7×7 grid is dropped
+    to save storage (49× reduction vs storing the full (E, C, H, W) tensor).
+
+    Args:
+        detector: Frozen detector (Faster R-CNN or EfficientDet).
+        images:   (B, 3, H, W) image batch.
+        union_boxes: Per-image list of (E_i, 4) xyxy union bounding boxes.
+
+    Returns:
+        (total_E, C) float32 tensor of pooled union features.
+    """
+    total_edges = sum(b.shape[0] for b in union_boxes)
+    if total_edges == 0:
+        c = detector.roi_feature_dim[0]
+        return torch.zeros(0, c, device=images.device)
+
+    # Extract spatial union features using the same path as per-object features
+    union_spatial = extract_gt_roi_features(detector, images, union_boxes)
+    # (total_E, C, H, W) → (total_E, C)
+    return F.adaptive_avg_pool2d(union_spatial, (1, 1)).flatten(1)
+
+
 # ---------------------------------------------------------------------------
 # HDF5 I/O
 # ---------------------------------------------------------------------------
@@ -478,6 +517,7 @@ def save_image_to_hdf5(
     *,
     scores: Tensor | None = None,
     relations: Tensor | None = None,
+    union_features: Tensor | None = None,
 ) -> None:
     """Write one image's data to an HDF5 group."""
     grp = h5file.create_group(image_id)
@@ -496,6 +536,14 @@ def save_image_to_hdf5(
         grp.create_dataset("scores", data=scores.numpy())
     if relations is not None:
         grp.create_dataset("relations", data=relations.numpy())
+    if union_features is not None:
+        uf = union_features.numpy()
+        grp.create_dataset(
+            "union_features",
+            data=uf,
+            compression="lzf",
+            chunks=uf.shape if uf.shape[0] > 0 else None,
+        )
 
 
 def write_metadata(
@@ -692,6 +740,7 @@ def process_gt(
     variant: str | None,
     num_classes: int,
     background_class: bool,
+    save_union_features: bool = False,
 ) -> None:
     """Extract and save ground truth features."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -727,6 +776,27 @@ def process_gt(
                     detector, images, gt_boxes_device
                 )
 
+                # Union features: pool at union box locations for all N*(N-1) pairs
+                union_feats_batch: list[Tensor] = []
+                if save_union_features:
+                    union_boxes_device: list[Tensor] = []
+                    for b in gt_boxes_device:
+                        if b.shape[0] >= 2:
+                            sub_i, obj_i = build_edge_index(b)
+                            union_boxes_device.append(
+                                compute_union_boxes(b[sub_i], b[obj_i])
+                            )
+                        else:
+                            union_boxes_device.append(
+                                torch.zeros(0, 4, device=device)
+                            )
+                    union_feats_flat = extract_union_roi_features(
+                        detector, images, union_boxes_device
+                    )  # (total_E, C)
+                    # Split back per-image by edge counts
+                    edge_counts = [ub.shape[0] for ub in union_boxes_device]
+                    union_feats_batch = list(union_feats_flat.cpu().split(edge_counts))
+
             # Save per-image
             offset = 0
             for i in range(batch_size):
@@ -743,6 +813,7 @@ def process_gt(
                     batch_boxes[i],
                     batch_labels[i],
                     relations=batch_relations[i],
+                    union_features=union_feats_batch[i] if save_union_features else None,
                 )
                 total_objects += n_i
                 total_relations += batch_relations[i].shape[0]
@@ -788,6 +859,7 @@ def main(
     max_images: int | None,
     relation_iou_thresh: float = 0.3,
     min_score: float = 0.01,
+    save_union_features: bool = False,
 ) -> None:
     """Run feature precomputation."""
     background_class = True
@@ -859,6 +931,8 @@ def main(
     if source in ("gt", "both"):
         gt_path = out_dir / f"gt_{split}.h5"
         print(f"\nExtracting GT features → {gt_path}")
+        if save_union_features:
+            print("  (union features enabled — this will increase file size)")
         process_gt(
             model,
             loader,
@@ -871,6 +945,7 @@ def main(
             variant=variant,
             num_classes=num_classes,
             background_class=background_class,
+            save_union_features=save_union_features,
         )
 
     print("\nDone.")
@@ -904,4 +979,5 @@ if __name__ == "__main__":
         max_images=args.max_images,
         relation_iou_thresh=args.relation_iou_thresh,
         min_score=args.min_score,
+        save_union_features=args.save_union_features,
     )

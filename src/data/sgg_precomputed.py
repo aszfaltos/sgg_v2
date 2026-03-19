@@ -110,6 +110,15 @@ class SGGPrecomputedDataset(Dataset[dict[str, Tensor]]):
         boxes = torch.from_numpy(grp["boxes"][:])  # (N, 4)
         labels = torch.from_numpy(grp["labels"][:])  # (N,)
 
+        # Union features (optional — only present in BGNN-precomputed files)
+        has_union = "union_features" in grp
+        N_full = roi_features.shape[0]
+        all_union: Tensor | None
+        if has_union:
+            all_union = torch.from_numpy(grp["union_features"][:])  # (N_full*(N_full-1), C)
+        else:
+            all_union = None
+
         has_pred_scores = "scores" in grp
         if has_pred_scores:
             scores = torch.from_numpy(grp["scores"][:])  # (N,)
@@ -124,10 +133,12 @@ class SGGPrecomputedDataset(Dataset[dict[str, Tensor]]):
 
         # -- Score filtering (pred features only) -------------------------
         # GT features have no scores dataset; never filter them.
+        keep_ids: Tensor | None = None  # original indices of kept objects; set when filtering
         if self._score_thresh > 0.0 and has_pred_scores:
             keep_mask = scores >= self._score_thresh
             if keep_mask.any():
                 keep_idx = keep_mask.nonzero(as_tuple=False).squeeze(1)
+                keep_ids = keep_idx
                 # Build old→new index map for relation re-indexing
                 old_to_new = torch.full((boxes.shape[0],), -1, dtype=torch.long)
                 old_to_new[keep_idx] = torch.arange(keep_idx.shape[0], dtype=torch.long)
@@ -158,7 +169,7 @@ class SGGPrecomputedDataset(Dataset[dict[str, Tensor]]):
         # -- Handle empty image (N == 0) ----------------------------------
         if N == 0:
             empty_e = torch.zeros(0, dtype=torch.int64)
-            return {
+            item: dict[str, Tensor] = {
                 "roi_features": roi_features,
                 "boxes": boxes,
                 "labels": labels,
@@ -168,6 +179,11 @@ class SGGPrecomputedDataset(Dataset[dict[str, Tensor]]):
                 "geo": torch.zeros(0, 12, dtype=torch.float32),
                 "rel_labels": empty_e,
             }
+            if has_union and all_union is not None:
+                item["union_features"] = torch.zeros(
+                    0, all_union.shape[1], dtype=all_union.dtype
+                )
+            return item
 
         # -- Build edge index (all N*(N-1) directed pairs) ----------------
         sub_idx, obj_idx = build_edge_index(boxes)
@@ -214,7 +230,7 @@ class SGGPrecomputedDataset(Dataset[dict[str, Tensor]]):
         else:
             geo = torch.zeros(0, 12, dtype=torch.float32)
 
-        return {
+        result: dict[str, Tensor] = {
             "roi_features": roi_features,
             "boxes": boxes,
             "labels": labels,
@@ -224,6 +240,28 @@ class SGGPrecomputedDataset(Dataset[dict[str, Tensor]]):
             "geo": geo,
             "rel_labels": rel_labels,
         }
+
+        # -- Union features (BGNN only) -----------------------------------
+        # Remap sampled (sub_idx, obj_idx) back to original N_full pair indices.
+        # build_edge_index ordering: pair (u→v) has flat index
+        #   u * (N_full - 1) + (v  if v < u  else  v - 1)
+        if has_union and all_union is not None and sub_idx.shape[0] > 0:
+            if keep_ids is not None:
+                orig_sub = keep_ids[sub_idx]
+                orig_obj = keep_ids[obj_idx]
+            else:
+                orig_sub = sub_idx
+                orig_obj = obj_idx
+            flat_idx = orig_sub * (N_full - 1) + torch.where(
+                orig_obj < orig_sub, orig_obj, orig_obj - 1
+            )
+            result["union_features"] = all_union[flat_idx]  # (E, C)
+        elif has_union and all_union is not None:
+            result["union_features"] = torch.zeros(
+                0, all_union.shape[1], dtype=all_union.dtype
+            )
+
+        return result
 
     # ------------------------------------------------------------------
     # h5py file handle (lazy, per-worker)

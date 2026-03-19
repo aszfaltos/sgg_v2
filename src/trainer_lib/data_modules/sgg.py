@@ -149,7 +149,7 @@ def sgg_collate(items: list[dict[str, Tensor]]) -> dict[str, Tensor]:
 
     edge_counts = [item["sub_idx"].shape[0] for item in items]
 
-    return {
+    batch = {
         "roi_features": torch.cat([item["roi_features"] for item in items]),
         "boxes": torch.cat([item["boxes"] for item in items]),
         "labels": torch.cat([item["labels"] for item in items]),
@@ -162,6 +162,14 @@ def sgg_collate(items: list[dict[str, Tensor]]) -> dict[str, Tensor]:
         "edge_counts": torch.tensor(edge_counts, dtype=torch.int64),
         "image_offsets": torch.tensor(offsets, dtype=torch.int64),
     }
+
+    # Union features (BGNN only — present when HDF5 was built with --save-union-features)
+    if "union_features" in items[0]:
+        batch["union_features"] = torch.cat(
+            [item["union_features"] for item in items]
+        )  # (total_E, C)
+
+    return batch
 
 
 # ---------------------------------------------------------------------------
